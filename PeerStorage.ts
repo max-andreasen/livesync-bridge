@@ -20,7 +20,33 @@ export class PeerStorage extends Peer {
         super(conf, dispatcher);
     }
 
+    normalizeVaultPath(path: string) {
+        return this.toPosixPath(path)
+            .replace(/^(\.\/)+/, "")
+            .replace(/^\/+/, "");
+    }
+
+    isIgnoredVaultPath(pathSrc: string) {
+        const path = this.normalizeVaultPath(pathSrc);
+        return (this.config.ignorePatterns ?? []).some((patternSrc) => {
+            const pattern = this.normalizeVaultPath(patternSrc);
+            if (!pattern) return false;
+            if (pattern.endsWith("/**")) {
+                const prefix = pattern.slice(0, -3);
+                return path === prefix || path.startsWith(`${prefix}/`);
+            }
+            if (pattern.endsWith("/")) {
+                return path.startsWith(pattern);
+            }
+            return path === pattern;
+        });
+    }
+
     async delete(pathSrc: string): Promise<boolean> {
+        if (this.isIgnoredVaultPath(pathSrc)) {
+            this.receiveLog(` ${pathSrc} ignored`);
+            return false;
+        }
         const lp = this.toLocalPath(pathSrc);
         const path = this.toStoragePath(lp);
         if (await this.isRepeating(lp, false)) {
@@ -38,6 +64,10 @@ export class PeerStorage extends Peer {
         return true;
     }
     async put(pathSrc: string, data: FileData): Promise<boolean> {
+        if (this.isIgnoredVaultPath(pathSrc)) {
+            this.receiveLog(` ${pathSrc} ignored`);
+            return false;
+        }
         const lp = this.toLocalPath(pathSrc);
         const path = this.toStoragePath(lp);
         if (await this.isRepeating(lp, data)) {
@@ -132,6 +162,9 @@ export class PeerStorage extends Peer {
     }
 
     async get(pathSrc: string): Promise<false | FileData> {
+        if (this.isIgnoredVaultPath(pathSrc)) {
+            return false;
+        }
         const lp = this.toLocalPath(pathSrc);
         const path = this.toStoragePath(lp);
         const stat = await Deno.stat(path);
@@ -156,6 +189,7 @@ export class PeerStorage extends Peer {
     async dispatch(pathSrc: string) {
         const lP = this.toStoragePath(this.toLocalPath("."));
         const path = this.toPosixPath(relative(lP, pathSrc));
+        if (this.isIgnoredVaultPath(path)) return;
 
         const data = await this.get(path);
 
@@ -177,6 +211,7 @@ export class PeerStorage extends Peer {
     async dispatchDeleted(pathSrc: string) {
         const lP = this.toStoragePath(this.toLocalPath("."));
         const path = this.toPosixPath(relative(lP, pathSrc));
+        if (this.isIgnoredVaultPath(path)) return;
         await scheduleOnceIfDuplicated(pathSrc, async () => {
             await delay(250);
             if (!await this.isRepeating(path, false)) {
@@ -199,6 +234,9 @@ export class PeerStorage extends Peer {
     }
 
     async writeFileStat(pathSrc: string, statSrc?: Deno.FileInfo) {
+        if (this.isIgnoredVaultPath(pathSrc)) {
+            return false;
+        }
         const lp = this.toLocalPath(pathSrc);
         const key = `file-stat-${lp}`;
         const path = this.toStoragePath(lp);
@@ -211,6 +249,9 @@ export class PeerStorage extends Peer {
     }
 
     async isChanged(pathSrc: string) {
+        if (this.isIgnoredVaultPath(pathSrc)) {
+            return false;
+        }
         const lp = this.toLocalPath(pathSrc);
         const key = `file-stat-${lp}`;
         const last = this.getSetting(key);
@@ -260,6 +301,7 @@ export class PeerStorage extends Peer {
             for await (const entry of walk(lP)) {
                 if (entry.isFile) {
                     const ePath = this.toPosixPath(relative(this.toLocalPath("."), entry.path));
+                    if (this.isIgnoredVaultPath(ePath)) continue;
                     if (await this.isChanged(ePath)) {
                         this.debugLog(`Offline changes detected: ${ePath}`);
                         await this.dispatch(entry.path);
@@ -293,6 +335,10 @@ export class PeerStorage extends Peer {
         this.watcher = chokidar.watch(lP,
             {
                 ignoreInitial: !this.config.scanOfflineChanges,
+                ignored: (path) => {
+                    const ePath = this.toPosixPath(relative(lP, path));
+                    return this.isIgnoredVaultPath(ePath);
+                },
                 awaitWriteFinish: {
                     stabilityThreshold: 500,
                 },
