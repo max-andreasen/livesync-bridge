@@ -14,9 +14,28 @@ export class PeerCouchDB extends Peer {
     constructor(conf: PeerCouchDBConf, dispatcher: DispatchFun) {
         super(conf, dispatcher);
         this.man = new DirectFileManipulator(conf);
+
+        // The headless API has no replicator, and DirectFileManipulator.$$getReplicator
+        // throws "Method not implemented." rather than saying so. When a note references
+        // chunks that are not in the local database, ChunkFetcher reaches for the
+        // replicator from inside a setTimeout with no catch around it, so the throw
+        // becomes an unhandled rejection and Deno kills the process: one unreadable note
+        // stops all sync for every file until the container is restarted.
+        //
+        // ChunkFetcher already handles a replicator that is simply absent — it logs, it
+        // returns, and the chunk waiters resolve to "missing" when they time out a few
+        // seconds later. Reporting the replicator as absent therefore routes the
+        // missing-chunk path through behaviour upstream already supports. Implementing
+        // the accessor would mean a large change to vendored code and a merge fight on
+        // the next upstream pull, so it is deliberately not implemented here.
+        this.man.$$getReplicator = (() => undefined) as unknown as DirectFileManipulator["$$getReplicator"];
+
         // Fetch remote since.
         this.man.since = this.getSetting("since") || "now";
     }
+
+    /** Paths whose content could not be assembled, reported once each. */
+    skipped = new Set<string>();
     async delete(pathSrc: string): Promise<boolean> {
         const path = this.toLocalPath(pathSrc);
         if (await this.isRepeating(pathSrc, false)) {
@@ -64,10 +83,18 @@ export class PeerCouchDB extends Peer {
     }
     async get(pathSrc: FilePathWithPrefix): Promise<false | FileData> {
         const path = this.toLocalPath(pathSrc) as FilePathWithPrefix;
-        const ret = await this.man.get(path) as false | ReadyEntry;
-        if (ret === false) {
+        let ret: false | ReadyEntry;
+        try {
+            ret = await this.man.get(path) as false | ReadyEntry;
+        } catch (ex) {
+            await this.reportSkipped(path, ex);
             return false;
         }
+        if (ret === false) {
+            await this.reportSkipped(path);
+            return false;
+        }
+        this.skipped.delete(path);
         return {
             ctime: ret.ctime,
             mtime: ret.mtime,
@@ -90,6 +117,27 @@ export class PeerCouchDB extends Peer {
             deleted: ret.deleted
         };
     }
+    /**
+     * A read that came back with nothing is either a file that is not in the sync bus
+     * at all — ordinary, and not worth a word — or one whose metadata is present while
+     * its chunks are not. Only the second is a skipped file: it will not sync until its
+     * chunks are repaired, and silence about it is what made this fault hard to see.
+     */
+    async reportSkipped(path: FilePathWithPrefix, ex?: unknown): Promise<void> {
+        let hasMeta: boolean;
+        try {
+            hasMeta = await this.man.get(path, true) !== false;
+        } catch (_) {
+            // Even the metadata would not read: something is wrong with this file.
+            hasMeta = true;
+        }
+        if (!hasMeta) return;
+        if (ex) this.normalLog(` ${path} read failed: ${ex}`);
+        if (this.skipped.has(path)) return;
+        this.skipped.add(path);
+        this.receiveLog(` ${path} SKIPPED (content unavailable, ${this.skipped.size} skipped so far)`, LOG_LEVEL_NOTICE);
+    }
+
     async start(): Promise<void> {
         const baseDir = this.toLocalPath("");
         await this.man.ready.promise;
